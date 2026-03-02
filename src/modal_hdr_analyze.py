@@ -4,12 +4,15 @@ Offloads hdr_analyzer_mvp to Modal.com cloud instances for faster processing.
 The binary is compiled inside the container image (x86_64 Ubuntu 24.04) to match
 the FFmpeg library ABI, mirroring the CI release workflow exactly.
 
-The apt FFmpeg packages don't include hevc_cuvid, so the binary falls back to
-software decoding automatically. On L4's fast x86_64 CPU, software decode of
-4K HEVC runs at ~40-60 fps — faster than ARM64 even without GPU decode.
+NVDEC hardware decode is attempted by default (--hwaccel auto). Ubuntu 24.04's
+apt FFmpeg includes ffnvcodec support; the NVIDIA Container Toolkit mounts
+libnvcuvid.so at runtime when the container has GPU + video capabilities.
+The binary falls back to software decode gracefully if NVDEC is unavailable.
 
 Usage:
     modal run src/modal_hdr_analyze.py --input video.mkv
+    modal run src/modal_hdr_analyze.py --input video.mkv --hwaccel auto    # default: try NVDEC
+    modal run src/modal_hdr_analyze.py --input video.mkv --hwaccel none    # force software
     modal run src/modal_hdr_analyze.py --input video.mkv --sample-rate 3
     modal run src/modal_hdr_analyze.py --input video.mkv --downscale 2
     modal run src/modal_hdr_analyze.py --input video.mkv --output custom.measurements.bin
@@ -130,15 +133,30 @@ def analyze_hdr(
     sample_rate: int = 1,
     scene_threshold: float = 0.3,
     downscale: int = 1,
+    hwaccel: str = "auto",
 ) -> dict:
     """Analyze an HDR video file and produce a madVR measurement .bin file.
 
     Reads input from and writes output to the shared Volume.
+
+    hwaccel: "auto" or "cuda" attempts NVDEC hardware decode first and falls
+             back to software automatically; "none" forces software decode.
     """
     input_path = f"{VOL_MOUNT}/jobs/{job_id}/input/{input_name}"
     output_dir = f"{VOL_MOUNT}/jobs/{job_id}/output"
     output_path = f"{output_dir}/{output_name}"
     Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Log which hardware acceleration methods FFmpeg knows about at runtime.
+    # libnvcuvid.so is mounted by the NVIDIA Container Toolkit — not at image
+    # build time — so this reflects actual runtime availability.
+    hwaccel_probe = subprocess.run(
+        ["ffmpeg", "-hwaccels"],
+        capture_output=True, text=True,
+    )
+    available_hwaccels = hwaccel_probe.stdout.strip()
+    print(f"[hwaccel] available: {available_hwaccels}")
+    cuda_listed = "cuda" in available_hwaccels.lower()
 
     cmd = [
         "hdr_analyzer_mvp",
@@ -152,6 +170,9 @@ def analyze_hdr(
         "--downscale",
         str(downscale),
     ]
+
+    if hwaccel in ("auto", "cuda"):
+        cmd.extend(["--hwaccel", "cuda"])
 
     print(f"[cmd] {' '.join(cmd)}")
     t0 = time.time()
@@ -170,12 +191,27 @@ def analyze_hdr(
             f"hdr_analyzer_mvp failed (rc={result.returncode}):\n{tail}"
         )
 
+    # Determine which decode path was actually used.
+    # We use two signals: whether CUDA was listed as available by ffmpeg at
+    # runtime, and whether the binary printed its specific fallback message.
+    combined_output = (result.stdout or "") + (result.stderr or "")
+    nvdec_fell_back = "CUDA decoder not available" in combined_output
+    if hwaccel == "none":
+        hwaccel_used = "software"
+    elif not cuda_listed:
+        hwaccel_used = "software (cuda hwaccel not available at runtime)"
+    elif nvdec_fell_back:
+        hwaccel_used = "software (nvdec fallback)"
+    else:
+        hwaccel_used = "nvdec"
+
     output_size = Path(output_path).stat().st_size
+    print(f"[hwaccel] decode path used: {hwaccel_used}")
     print(f"[time] Analysis: {elapsed:.2f}s")
     print(f"[size] output: {output_size} bytes")
 
     volume.commit()
-    return {"analysis_time": elapsed, "output_size": output_size}
+    return {"analysis_time": elapsed, "output_size": output_size, "hwaccel_used": hwaccel_used}
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +239,7 @@ def main(
     sample_rate: int = 1,
     scene_threshold: float = 0.3,
     downscale: int = 1,
+    hwaccel: str = "auto",
 ):
     """Upload a video file to Modal, run HDR analysis, download the .bin result.
 
@@ -212,10 +249,14 @@ def main(
         --sample-rate     Analyze every Nth frame (default: 1; use 3 for ~3x speedup)
         --scene-threshold Scene cut threshold (default: 0.3)
         --downscale       Analysis resolution divisor (default: 1; use 2 for ~2x speedup)
+        --hwaccel         Hardware decode: "auto" tries NVDEC (default), "none" forces software
     """
     input_path = Path(input)
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
+
+    if hwaccel not in ("auto", "cuda", "none"):
+        raise ValueError(f"--hwaccel must be 'auto', 'cuda', or 'none', got '{hwaccel}'")
 
     if output is None:
         output = f"{input_path.stem}.measurements.bin"
@@ -231,6 +272,7 @@ def main(
     print(f"  Sample rate:  every {sample_rate} frame(s)")
     print(f"  Scene thresh: {scene_threshold}")
     print(f"  Downscale:    {downscale}x")
+    print(f"  HW Accel:     {hwaccel}")
     print("=" * 55)
 
     input_name = input_path.name
@@ -261,6 +303,7 @@ def main(
             sample_rate=sample_rate,
             scene_threshold=scene_threshold,
             downscale=downscale,
+            hwaccel=hwaccel,
         )
         t_analyze_wall = time.time() - t_analyze_start
         print(
@@ -303,5 +346,6 @@ def main(
     )
     print(f"  Download:    {t_download:.2f}s")
     print(f"  Total:       {t_total:.2f}s")
+    print(f"  HW Decode:   {result.get('hwaccel_used', 'unknown')}")
     print("=" * 55)
     print(f"\nDone: {output_path}")
